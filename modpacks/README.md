@@ -10,12 +10,23 @@ Click **📦 Modpacks** next to 🧪 Mods on the main window.
 - A pack is a folder of mods in `Modpacks` next to the game, like `Modpacks\QoL\`.
 - Each pack is **Off**, **On everywhere**, or **Only on these servers**. Pick the servers from your
   saved and recent servers, or add the one in the IP box.
+- For mods needed on most or all servers, make a shared pack and set it to **On everywhere**.
+  It loads alongside the server's own pack.
+- If a server-specific pack and an **On everywhere** pack contain different versions with the same filename,
+  the server-specific copy wins for that server. The shared copy remains in its pack and is used on other
+  servers. Different versions in two packs both scoped to the same server still need to be resolved.
 - Several packs can be on at once. Untick a mod to leave it out of its pack without removing it.
 - When the game starts, Modpacks copies the mods of every pack that's on for that server into `Mods`,
   and takes out the ones it put there before that aren't wanted now.
-- Loose mods in `Mods` are yours. They always load, and Modpacks only changes them when you click a button.
+- Loose mods in `Mods` are yours and otherwise always load. Modpacks leaves them alone except when an active
+  linked pack has the same filename, as described below.
 - While a pack is on, its mods sit in `Mods` next to your loose mods. The window's loose list shows only yours.
+- When a linked pack is on for a server, its copy wins over a different loose DLL with the same filename.
+  Modpacks saves the loose copy in `Modpacks\_shadowed` and restores it on a later launch when no active pack
+  uses that filename.
 - A Main Menu launch loads only the packs that are On everywhere.
+- The first time you join a server with no active pack, Modpacks asks whether to use the default `Mods` folder.
+  You can remember either choice for that server. Choosing to set up a pack opens Modpacks and cancels that launch.
 - The launcher log says which packs loaded, like `Modpacks: QoL, Velaris (12 mods)`.
 
 ## The window
@@ -38,7 +49,14 @@ Some servers publish their client mods as a list, like Sheikah Sanctuary's
 that downloads those mods and keeps them up to date.
 
 - If the link's site is one of your saved or recent servers, the pack loads only on that server.
-- When the launcher opens, Modpacks checks every linked pack and asks before downloading anything.
+- When the launcher opens, Modpacks checks linked packs concurrently and asks before applying changes. It also
+  checks the relevant linked pack again just before joining, so changes made while the launcher was open can be
+  installed before you connect. Manifest requests bypass HTTP and URL-keyed caches so checks see the latest list.
+  If that quick check can't reach the update site, the current pack is used.
+- The update preview includes mods added to or removed from the link, including files managed by the launcher.
+  Accepting removes unchanged linked files that are no longer listed; files you changed yourself are kept.
+  `TavernEssentials.dll` in a pack or linked manifest is handled like any other pack mod and is installed,
+  updated, and removed with that pack. A loose copy is also handled like any other loose mod.
 - Every file must come over https from the same site as the list and match its SHA-256, or nothing changes.
 - Mods you add to a linked pack yourself, or files you change, are never overwritten.
 - A mod you delete or move out of a linked pack isn't downloaded again. Add it back with **Add files...**.
@@ -61,13 +79,12 @@ A list is JSON in this shape. `name` and `servers` are optional:
 ## Good to know
 
 - If two packs have different files with the same name, a pack mod is also loose in `Mods` as a
-  different file, or the same mod would load twice, Modpacks asks what to do before the game starts.
-  You don't need to delete anything yourself:
-  - **Remove and play** plays with the pack's copy and sends the extra copy in `Mods` to the Recycle Bin.
+  different file (unless an active linked pack provides it), or the same mod would load twice, Modpacks
+  asks what to do before the game starts:
+  - **Remove and play** sends the loose files in the way to the Recycle Bin, then starts the game.
     It only shows when a loose file is part of the problem.
-  - **Run anyway** plays without the pack's copies this time, so a copy already in `Mods` is the one that
-    loads. Nothing is deleted.
-  - **Close** doesn't start the game and changes nothing.
+  - **Run anyway** starts the game without the clashing pack mods, this time only. Your loose mods stay.
+  - **Close** stops the launch and changes nothing.
 - If the game is already running, nothing changes and the launch goes ahead as usual.
 - If a file can't be changed, everything is put back the way it was and the launch stops.
 - A mod that no pack holds anymore is never deleted. It's kept in `Modpacks\_removed`. Mods you delete
@@ -75,7 +92,8 @@ A list is JSON in this shape. `name` and `servers` are optional:
 - Moving mods and adding or deleting loose mods need the game closed, because it holds the mods open.
   Deleting a mod from a pack works anytime. Its copy leaves `Mods` the next time the game starts.
 - Config files and `UserData` are shared by all packs.
-- TavernEssentials and Circuit's Voice Chat belong to the launcher, so they never go in a pack.
+- Circuit's Voice Chat belongs to the launcher and is never managed by Modpacks. `TavernEssentials.dll` can
+  be included in a pack or managed as a loose mod like any other mod.
 - Export leaves out your mode and servers. An imported pack starts Off, and mods named
   `*.Server.dll` come in unticked because they look like server mods.
 

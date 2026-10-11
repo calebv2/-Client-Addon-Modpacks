@@ -12,6 +12,8 @@ from . import melon
 
 PACKS_DIR = "Modpacks"
 REMOVED_DIR = "_removed"
+SHADOWED_DIR = "_shadowed"
+SHADOWED_STATE = "state.json"
 PACK_FILE = "pack.json"
 LEDGER_FILE = "modpacks_ledger.json"
 TEMP_SUFFIX = ".modpacks-tmp"
@@ -91,8 +93,12 @@ def is_dll(name):
 
 
 def is_launcher_mod(name):
+    return is_pack_managed_mod(name)
+
+
+def is_pack_managed_mod(name):
     low = name.lower()
-    return low == "tavernessentials.dll" or (low.startswith("circuitsvoicechat") and low.endswith(".dll"))
+    return low.startswith("circuitsvoicechat") and low.endswith(".dll")
 
 
 def looks_server_only(name):
@@ -333,12 +339,52 @@ def loose_files(mods_dir):
                   key=str.lower)
 
 
+def shadowed_dir(game_dir):
+    return os.path.join(packs_dir(game_dir), SHADOWED_DIR)
+
+
+def read_shadowed(game_dir):
+    path = os.path.join(shadowed_dir(game_dir), SHADOWED_STATE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        raise ModpacksError("The saved loose-mod copies couldn't be read (%s)." %
+                            (getattr(error, "strerror", None) or str(error)))
+    if not isinstance(data, list):
+        raise ModpacksError("The saved loose-mod copy list is invalid.")
+    records = {}
+    for entry in data:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("file"), str)
+                or not is_dll(entry["file"]) or entry["file"] in (".", "..")
+                or BAD_NAME.search(entry["file"])
+                or not isinstance(entry.get("backup"), str)
+                or entry["backup"] in (".", "..") or BAD_NAME.search(entry["backup"])
+                or not isinstance(entry.get("sha256"), str)
+                or not re.match(r"^[0-9A-Fa-f]{64}$", entry["sha256"])):
+            raise ModpacksError("The saved loose-mod copy list is invalid.")
+        record = {"file": entry["file"], "backup": entry["backup"],
+                  "sha256": entry["sha256"].upper()}
+        records.pop(record["file"].lower(), None)
+        records[record["file"].lower()] = record
+    return list(records.values())
+
+
+def write_shadowed(game_dir, records):
+    folder = shadowed_dir(game_dir)
+    os.makedirs(folder, exist_ok=True)
+    write_json(os.path.join(folder, SHADOWED_STATE), records)
+
+
 class Plan:
     def __init__(self, game_dir, target, ledger_path=None, lookup=None, leave_out=None):
         self.game_dir = game_dir
         self.target = target
         self.mods_dir = os.path.join(game_dir, "Mods")
         self.ledger_path = ledger_path or ledger_file()
+        self.shadowed = read_shadowed(game_dir)
         lookup_cache = {}
 
         def cached(host):
@@ -388,11 +434,12 @@ class Plan:
     def _want(self):
         self.wanted = {}
         found = {}
+        self.overrides = []
         for pack in self.active:
             for name in pack.files():
                 if not pack.ticked(name):
                     continue
-                if is_launcher_mod(name):
+                if is_pack_managed_mod(name):
                     self.notes.append("%s in pack %s is the launcher's own mod, so it was left out."
                                       % (name, pack.name))
                     continue
@@ -406,19 +453,34 @@ class Plan:
                     self.conflicts.append(Conflict("%s in pack %s can't be read (%s)" % (name, pack.name, _why(error)),
                                                    "unreadable", [(pack.name, name)]))
                     continue
-                found.setdefault(name.lower(), []).append((pack.name, name, path, digest))
+                found.setdefault(name.lower(), []).append(
+                    (pack.name, name, path, digest, bool(pack.source.get("url")), pack.mode))
         for low, copies in found.items():
-            pack_name, name, path, digest = copies[0]
-            places = [(c[0], c[1]) for c in copies]
-            packs = [c[0] for c in copies]
-            if any(c[3] != digest for c in copies):
+            shared = [copy for copy in copies if copy[5] == "all"]
+            server_specific = [copy for copy in copies if copy[5] == "servers"]
+            if shared and server_specific:
+                selected = server_specific
+                selected_hashes = {copy[3] for copy in selected}
+                if any(copy[3] not in selected_hashes for copy in shared):
+                    self.overrides.append({
+                        "file": selected[0][1],
+                        "server_packs": [copy[0] for copy in selected],
+                        "shared_packs": [copy[0] for copy in shared],
+                    })
+            else:
+                selected = copies
+            pack_name, name, path, digest, linked, _ = selected[0]
+            places = [(copy[0], copy[1]) for copy in selected]
+            packs = [copy[0] for copy in selected]
+            if any(copy[3] != digest for copy in selected):
                 text = "%s is in packs %s, and the %s are different" % (
                     name, listed(packs), "two files" if len(packs) == 2 else "files")
                 self.conflicts.append(Conflict(text, "packs", places))
                 continue
             self.wanted[low] = {"file": name, "source": path, "sha256": digest, "pack": pack_name,
-                                "packs": packs, "copies": places}
+                                "packs": packs, "copies": places, "linked": any(copy[4] for copy in selected)}
         self.identical = []
+        self.shadow_now = []
         for low, item in sorted(self.wanted.items()):
             if low not in self.loose:
                 continue
@@ -428,6 +490,9 @@ class Plan:
                 digest = None
             if digest == item["sha256"]:
                 self.identical.append(low)
+            elif item["linked"] and digest is not None:
+                self.shadow_now.append({"file": self.loose[low], "sha256": digest})
+                self.loose.pop(low)
             else:
                 self.conflicts.append(Conflict("%s from pack %s is also loose in Mods as a different file"
                                                % (item["file"], item["pack"]), "loose", item["copies"],
@@ -471,6 +536,18 @@ class Plan:
             if low in self.loose:
                 continue
             self.add.append(item)
+        removing = {entry["file"].lower() for entry in self.remove}
+        loose = set(self.loose)
+        wanted = set(self.wanted)
+        restored = set()
+        self.restore_shadowed = []
+        for entry in self.shadowed:
+            low = entry["file"].lower()
+            if low in wanted or low in loose or low in restored:
+                continue
+            if low in removing or not os.path.lexists(os.path.join(self.mods_dir, entry["file"])):
+                self.restore_shadowed.append(entry)
+                restored.add(low)
 
     def summary(self):
         if not self.active:
@@ -555,6 +632,7 @@ class Result:
         self.plan = plan
         self.added = []
         self.removed = []
+        self.shadowed = []
         self.kept_aside = []
         self.warnings = []
         self.skipped = None
@@ -589,7 +667,7 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
     packs = {e["file"].lower(): e["pack"] for e in plan.keep}
     intent = [dict(e, pack=packs.get(e["file"].lower(), e.get("pack", ""))) for e in before
               if e["file"].lower() not in leaving] + [_entry(item) for item in plan.add]
-    if not plan.add and not plan.remove:
+    if not plan.add and not plan.remove and not plan.shadow_now and not plan.restore_shadowed:
         if ledger.get(key) != intent:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             ledger[key] = intent
@@ -598,7 +676,47 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ledger[key] = before + [_entry(item) for item in plan.add]
     write_json(path, ledger)
+    original_shadowed = [dict(entry) for entry in plan.shadowed]
+    shadow_records = [dict(entry) for entry in plan.shadowed]
+    created_backups = []
+    try:
+        if plan.shadow_now:
+            folder = shadowed_dir(game_dir)
+            os.makedirs(folder, exist_ok=True)
+            for entry in plan.shadow_now:
+                existing = next((old for old in shadow_records
+                                 if old["file"].lower() == entry["file"].lower()), None)
+                if existing is not None and existing["sha256"] == entry["sha256"]:
+                    saved = os.path.join(folder, existing["backup"])
+                    try:
+                        if os.path.isfile(saved) and sha256(saved) == entry["sha256"]:
+                            continue
+                    except OSError:
+                        pass
+                backup = unique_path(folder, entry["file"])
+                shutil.copyfile(os.path.join(mods_dir, entry["file"]), backup)
+                created_backups.append(backup)
+                if sha256(backup) != entry["sha256"]:
+                    raise OSError(5, "the file changed while its safe copy was being made",
+                                  os.path.join(mods_dir, entry["file"]))
+                shadow_records = [old for old in shadow_records
+                                  if old["file"].lower() != entry["file"].lower()]
+                shadow_records.append({"file": entry["file"], "backup": os.path.basename(backup),
+                                      "sha256": entry["sha256"]})
+        if shadow_records != original_shadowed:
+            write_shadowed(game_dir, shadow_records)
+    except OSError as error:
+        for backup in created_backups:
+            try:
+                os.remove(backup)
+            except OSError:
+                pass
+        ledger[key] = before
+        write_json(path, ledger)
+        raise ModpacksError("A safe copy of a loose mod couldn't be saved (%s)." % _why(error)) from error
     staged = []
+    shadow_staged = []
+    restored_shadow = []
     placed = []
     temp = None
     try:
@@ -606,6 +724,17 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
             live = os.path.join(mods_dir, entry["file"])
             os.replace(live, live + OLD_SUFFIX)
             staged.append((live, entry))
+        for entry in plan.shadow_now:
+            live = os.path.join(mods_dir, entry["file"])
+            os.replace(live, live + OLD_SUFFIX)
+            shadow_staged.append(live)
+        for entry in plan.restore_shadowed:
+            backup = os.path.join(shadowed_dir(game_dir), entry["backup"])
+            live = os.path.join(mods_dir, entry["file"])
+            if sha256(backup) != entry["sha256"]:
+                raise OSError(5, "a saved loose mod copy has changed", backup)
+            os.replace(backup, live)
+            restored_shadow.append((backup, live, entry))
         for item in plan.add:
             live = os.path.join(mods_dir, item["file"])
             if os.path.lexists(live + TEMP_SUFFIX):
@@ -619,11 +748,36 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
             os.replace(temp, live)
             temp = None
             placed.append(live)
+        restored = {entry["backup"] for entry in plan.restore_shadowed}
+        remaining_shadowed = [entry for entry in shadow_records if entry["backup"] not in restored]
+        if remaining_shadowed != shadow_records:
+            write_shadowed(game_dir, remaining_shadowed)
+        ledger[key] = intent
+        write_json(path, ledger)
     except OSError as error:
         problems = _rollback(staged, placed, temp)
-        if not problems:
-            ledger[key] = before
-            write_json(path, ledger)
+        for backup, live, entry in reversed(restored_shadow):
+            try:
+                os.replace(live, backup)
+            except OSError:
+                problems.append(entry["file"])
+        for live in reversed(shadow_staged):
+            try:
+                os.replace(live + OLD_SUFFIX, live)
+            except OSError:
+                problems.append(os.path.basename(live))
+        try:
+            if not problems:
+                ledger[key] = before
+                write_json(path, ledger)
+            if shadow_records != original_shadowed:
+                write_shadowed(game_dir, original_shadowed)
+            if not problems:
+                for backup in created_backups:
+                    if os.path.exists(backup):
+                        os.remove(backup)
+        except OSError as rollback_error:
+            problems.append("saved state (%s)" % _why(rollback_error))
         name = os.path.basename(error.filename or "") or "A mod file"
         for suffix in (TEMP_SUFFIX, OLD_SUFFIX):
             if name.lower().endswith(suffix):
@@ -634,9 +788,14 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
             message = "%s couldn't be changed (%s), and these couldn't be put back: %s" % (
                 name, _why(error), ", ".join(problems))
         raise ModpacksError(message)
-    ledger[key] = intent
-    write_json(path, ledger)
     result.added = [item["file"] for item in plan.add]
+    result.shadowed = [entry["file"] for entry in plan.shadow_now]
+    for live in shadow_staged:
+        try:
+            os.remove(live + OLD_SUFFIX)
+        except OSError as error:
+            result.warnings.append("%s's saved copy is safe, but a temporary file couldn't be cleaned up (%s)"
+                                   % (os.path.basename(live), _why(error)))
     for live, entry in staged:
         result.removed.append(entry["file"])
         try:
@@ -788,7 +947,7 @@ def add_files(pack, paths):
         if not is_dll(name):
             refused.append("%s (not a .dll)" % name)
             continue
-        if is_launcher_mod(name):
+        if is_pack_managed_mod(name):
             refused.append("%s (the launcher manages it)" % name)
             continue
         target = os.path.join(pack.path, name)
@@ -817,7 +976,7 @@ def move_loose(game_dir, names, pack):
     moved = []
     try:
         for name in names:
-            if is_launcher_mod(name) or not is_dll(name):
+            if is_pack_managed_mod(name) or not is_dll(name):
                 raise ModpacksError("%s can't go in a pack." % name)
             source = os.path.join(mods_dir, name)
             target = os.path.join(pack.path, name)
@@ -920,7 +1079,7 @@ def unpack(game_dir, pack, ledger_path=None, names=None, running=None):
     for name in pack.files():
         if picked is not None and name.lower() not in picked:
             continue
-        if is_launcher_mod(name):
+        if is_pack_managed_mod(name):
             refused.append("%s (the launcher manages it)" % name)
             continue
         try:
@@ -980,7 +1139,7 @@ def delete_mods(game_dir, targets, ledger_path=None, running=None):
             _remember(pack, {name.lower(): digest})
         except OSError as error:
             notes.append("%s couldn't note that %s is gone (%s)" % (pack.name, name, _why(error)))
-    names = {n.lower() for n in deleted if not is_launcher_mod(n)}
+    names = {n.lower() for n in deleted if not is_pack_managed_mod(n)}
     if not names:
         return deleted, notes, [], []
     cleared, left = _clear_copies(game_dir, names, ledger_path or ledger_file(),
@@ -1205,7 +1364,7 @@ def import_pack(game_dir, zip_path, name):
                     except (ValueError, UnicodeDecodeError):
                         shared = {}
                     continue
-                if is_launcher_mod(entry_name):
+                if is_pack_managed_mod(entry_name):
                     skipped.append("%s (the launcher manages it)" % entry_name)
                     continue
                 with archive.open(info) as source, open(os.path.join(work, entry_name), "wb") as target:
