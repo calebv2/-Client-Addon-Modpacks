@@ -432,7 +432,7 @@ class ModpacksWindow(tk.Toplevel):
             row.pack(fill="x", padx=8, pady=3)
             var = tk.BooleanVar(value=pack.ticked(name))
             self.keep.append(var)
-            launcher = engine.is_launcher_mod(name)
+            launcher = engine.is_pack_managed_mod(name)
             box = tk.Checkbutton(row, variable=var, bg=t.SURF, activebackground=t.SURF, selectcolor=t.AMBERDIM,
                                  highlightthickness=0, bd=0,
                                  command=lambda n=name, v=var: self.toggle_mod(n, v.get()))
@@ -494,6 +494,9 @@ class ModpacksWindow(tk.Toplevel):
             title, detail = _mod_line(item["source"], item["file"])
             text = "%s  %s" % (title, detail) if detail else title
             where = "pack " + ", ".join(item["packs"])
+            override = next((entry for entry in plan.overrides if entry["file"].lower() == low), None)
+            if override:
+                where += " (server version overrides " + ", ".join(override["shared_packs"]) + ")"
             if low in plan.identical:
                 where += ", already loose in Mods"
             row = tk.Frame(inner, bg=t.SURF)
@@ -705,13 +708,28 @@ class ModpacksWindow(tk.Toplevel):
             return
         found = source.changes(pack, manifest)
         notes = (" Not changed: " + ", ".join(found["kept"]) + ".") if found["kept"] else ""
-        if found["dropped"]:
-            notes += " Removed by you, not downloaded: " + ", ".join(found["dropped"]) + "."
+        unlisted = found.get("unlisted", found["removed"])
         if not source.count(found):
+            try:
+                source.record_manifest(pack, manifest)
+            except OSError as save_error:
+                self.say("Couldn't save the checked mod list (%s)." % engine._why(save_error), True)
+                return
             self.say("%s is up to date.%s" % (name, notes))
             return
-        if not messagebox.askyesno("Update %s" % name, "%s has updates:\n\n%s\n\nDownload them now?"
-                                   % (name, "\n".join(source.preview(pack, found))), parent=self):
+        prompt = "%s has changes:\n\n%s" % (name, "\n".join(source.preview(pack, found)))
+        if unlisted:
+            prompt += "\n\nThe link no longer lists the mods under \"Removed from link\"."
+            if found["removed"]:
+                prompt += " Accepting removes unchanged copies from the pack."
+        if found.get("protected") or found.get("managed_added"):
+            prompt += " Launcher-managed files are reported but never installed or removed by Modpacks."
+        if found.get("dropped"):
+            prompt += ("\n\nThe mods marked \"Back on link, still skipped because you removed it\" "
+                       "will remain excluded. Add them back to the pack if you want them.")
+        prompt += "\n\nApply these changes now?"
+        title = "Update %s" % name if not unlisted else "Update %s from link" % name
+        if not messagebox.askyesno(title, prompt, parent=self):
             self.say("")
             return
         self.say("Updating %s..." % name)
@@ -1086,6 +1104,61 @@ class LooseDialog(tk.Toplevel):
         self.destroy()
 
 
+class NoPackDialog(tk.Toplevel):
+    def __init__(self, owner, server):
+        super().__init__(owner)
+        _chrome._start_hidden(self)
+        t = _theme
+        self.choice = "setup"
+        self.dont_ask = False
+        self.title("No modpack for this server")
+        self.configure(bg=t.BG)
+        try:
+            if owner.winfo_viewable():
+                self.transient(owner)
+        except Exception:
+            pass
+        tk.Label(
+            self,
+            text="No modpack is set up for %s.\n\nUse your default Mods folder for this server? "
+                 "Your loose mods will load." % server,
+            bg=t.BG, fg=t.PARCH, font=("Segoe UI", 10), wraplength=420, justify="left"
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        self.remember = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            self, text="Don't ask again for this server", variable=self.remember,
+            bg=t.BG, fg=t.PARCH, activebackground=t.BG, activeforeground=t.PARCH,
+            selectcolor=t.SURF
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+        row = tk.Frame(self, bg=t.BG)
+        row.pack(fill="x", padx=16, pady=(2, 14))
+        _theme._btn(row, "Use default Mods", lambda: self.pick("default"), "primary",
+                    font=("Georgia", 10, "bold"), pady=6, padx=12).pack(side="left")
+        _theme._btn(row, "Set up a modpack...", lambda: self.pick("setup"),
+                    font=("Segoe UI", 9), pady=6, padx=10).pack(side="left", padx=6)
+        self.protocol("WM_DELETE_WINDOW", lambda: self.pick("setup"))
+        self.bind("<Escape>", lambda e: self.pick("setup"))
+        self.update_idletasks()
+        width, height = max(460, self.winfo_reqwidth()), self.winfo_reqheight()
+        try:
+            x = owner.winfo_rootx() + max(0, (owner.winfo_width() - width) // 2)
+            self.geometry("%dx%d+%d+%d" % (width, height, x, owner.winfo_rooty() + 60))
+        except Exception:
+            self.geometry("%dx%d" % (width, height))
+        _chrome._finish_dark_window(self)
+        self.lift()
+        try:
+            self.grab_set()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def pick(self, choice):
+        self.choice = choice
+        self.dont_ask = self.remember.get()
+        self.destroy()
+
+
 class ConflictDialog(tk.Toplevel):
     def __init__(self, owner, conflicts, loose):
         super().__init__(owner)
@@ -1099,24 +1172,20 @@ class ConflictDialog(tk.Toplevel):
                 self.transient(owner)
         except Exception:
             pass
-        tk.Label(self, text="Some mods are here twice. The game can only load one copy of each:", bg=t.BG,
-                 fg=t.PARCH, font=("Segoe UI", 10, "bold"), wraplength=480, justify="left").pack(
-            anchor="w", padx=16, pady=(12, 6))
+        tk.Label(self, text="These mods clash, so the game can't start with all of them:", bg=t.BG, fg=t.PARCH,
+                 font=("Segoe UI", 10, "bold"), wraplength=480, justify="left").pack(anchor="w", padx=16, pady=(12, 6))
         box = tk.Frame(self, bg=t.SURF, highlightbackground=t.BORDER, highlightthickness=1)
         box.pack(fill="x", padx=16)
         for conflict in conflicts:
-            tk.Label(box, text="• " + conflict, bg=t.SURF, fg=t.AMBER, font=("Segoe UI", 9), wraplength=460,
+            tk.Label(box, text="✖ " + conflict, bg=t.SURF, fg=t.RED, font=("Segoe UI", 9), wraplength=460,
                      justify="left", anchor="w").pack(anchor="w", padx=8, pady=3)
-        tk.Label(self, text="You don't need to delete anything yourself. Pick one:", bg=t.BG, fg=t.PARCH,
-                 font=("Segoe UI", 9), wraplength=480, justify="left").pack(anchor="w", padx=16, pady=(10, 0))
         steps = []
         if loose:
-            steps.append(("Remove and play", "Plays with the pack's copy. The extra %s in your Mods folder %s to the "
-                          "Recycle Bin." % (engine.listed(loose), "goes" if len(loose) == 1 else "go")))
-            steps.append(("Run anyway", "Plays with the copy in your Mods folder this time. Nothing is deleted."))
-        else:
-            steps.append(("Run anyway", "Plays without these mods this time. Nothing is deleted."))
-        steps.append(("Close", "Doesn't start the game. Nothing changes."))
+            steps.append(("Remove and play", "Moves %s from the Mods folder to the Recycle Bin, then starts the game "
+                          "with your packs." % engine.listed(loose)))
+        steps.append(("Run anyway", "Starts the game without the clashing pack mods, this time only. Your loose "
+                      "mods stay as they are."))
+        steps.append(("Close", "Stops here. Nothing changes."))
         for name, text in steps:
             row = tk.Frame(self, bg=t.BG)
             row.pack(fill="x", padx=16, pady=(8, 0))
