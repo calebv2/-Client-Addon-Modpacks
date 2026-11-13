@@ -10,7 +10,7 @@ import tavern_shared.theme as _theme
 
 from . import engine, source, window
 
-CHECK_DELAY_MS = 3000
+CHECK_DELAY_MS = 0
 MODS_BUTTON = "\U0001F9EA Mods"
 AFTER_TEXTS = ("\U0001F4C1 Mods Folder", "☑ Toggle Mods")
 BUTTON_TEXT = "\U0001F4E6 Modpacks"
@@ -125,52 +125,55 @@ def _has_active_pack(game_dir, target):
     return any(pack.links(target, engine.resolve) for pack in engine.list_packs(game_dir))
 
 
-def _update_prompt(blocks, has_unlisted, context, has_deletions=False,
-                   has_protected=False, has_dropped=False):
-    title = "Modpack changes" if has_unlisted else "Modpack updates"
-    message = "Changes are ready:\n\n" + "\n\n".join(blocks)
-    if has_unlisted:
-        message += ("\n\nThe update link no longer lists the mods shown under "
-                    "\"Removed from link\".")
-        if has_deletions:
-            message += " Accepting removes unchanged copies from the pack."
-        if has_protected:
-            message += " Launcher-managed files are reported but never installed or removed by Modpacks."
-    if has_dropped:
-        message += ("\n\nMods marked \"Back on link, still skipped because you removed it\" "
-                    "remain excluded; add them back to the pack if you want to use them.")
-    message += "\n\nApply these changes%s?" % context
-    return title, message
+def _status(root, text=""):
+    button = getattr(root, "_modpacks_button", None)
+    if button is not None:
+        try:
+            button.configure(text=BUTTON_TEXT + (" · " + text if text else ""))
+        except tk.TclError:
+            pass
+
+
+def _prompt_parent(root):
+    dialog = getattr(root, "_modpacks_wait_dialog", None)
+    if dialog is not None:
+        dialog.deiconify()
+        return dialog
+    return root
+
+
+def _defer_report(game_dir, report):
+    for name, manifest, found, problem in report:
+        pack = engine.find_pack(game_dir, name)
+        if pack is not None and not problem and manifest is not None and found is not None:
+            source.defer_changes(pack, manifest, found)
 
 
 def _check_join_updates(game_dir, target):
     if threading.current_thread() is not threading.main_thread():
         return
-    report = source.check_target(game_dir, target)
-    waiting, blocks = [], []
+    report = window.run_waiting(_app(), lambda: source.check_target(game_dir, target),
+                                "Checking this server's modpacks before joining...")
+    waiting = []
     for name, manifest, found, problem in report:
         if problem:
             _log("Modpacks: couldn't quickly check %s before joining (%s); using installed files"
                  % (name, problem), "warn")
         elif source.count(found):
-            waiting.append((name, manifest, found, None))
             pack = engine.find_pack(game_dir, name)
-            lines = source.preview(pack, found) if pack is not None else [source.describe(found)]
-            blocks.append(name + "\n" + "\n".join("    " + line for line in lines))
+            if pack is None or source.changes_deferred(pack, manifest, found):
+                continue
+            waiting.append((name, manifest, found, None))
     if not waiting:
         return
     server = _server_key(target)
-    has_unlisted = any(found.get("unlisted", found["removed"]) for _, _, found, _ in waiting)
-    has_deletions = any(found["removed"] for _, _, found, _ in waiting)
-    has_protected = any(found.get("protected") or found.get("managed_added")
-                        for _, _, found, _ in waiting)
-    has_dropped = any(found.get("dropped") for _, _, found, _ in waiting)
-    title, prompt = _update_prompt(blocks, has_unlisted, " before joining %s" % server,
-                                  has_deletions, has_protected, has_dropped)
-    if not messagebox.askyesno(title, prompt, parent=_app()):
+    if not window.ask_updates(_app(), game_dir, waiting, server=server):
+        _defer_report(game_dir, waiting)
         _log("Modpacks: updates skipped before joining %s; using installed files" % server, "warn")
         return
-    for name, found, problem in source.update_all(game_dir, waiting):
+    done = window.run_waiting(_app(), lambda: source.update_all(game_dir, waiting),
+                              "Updating this server's modpacks before joining...")
+    for name, found, problem in done:
         if problem:
             _log("Modpacks: %s wasn't updated before joining (%s); using installed files"
                  % (name, problem), "err")
@@ -206,9 +209,7 @@ def _apply(game_dir, target):
                 raise
 
 
-def before_launch(args):
-    if not _is_game(args):
-        return
+def _before_launch(args):
     game_dir = os.path.dirname(os.path.abspath(os.fspath(args[0])))
     target = engine.target_from_args(list(args))
     try:
@@ -256,6 +257,30 @@ def before_launch(args):
             window_open.after_idle(window_open.refresh)
     except Exception:
         pass
+
+
+def before_launch(args):
+    if not _is_game(args):
+        return
+    game_dir = os.path.dirname(os.path.abspath(os.fspath(args[0])))
+    if engine.game_running(game_dir):
+        _log("Modpacks: the game is already running, so modpacks are unchanged", "warn")
+        return
+    root = _app()
+    if getattr(root, "_modpacks_launching", False):
+        raise engine.ModpacksError("A launch is already waiting for Modpacks. Please wait for it to finish.")
+    if root is not None:
+        root._modpacks_launching = True
+    try:
+        if root is not None and threading.current_thread() is threading.main_thread():
+            window.wait_for(root, lambda: not getattr(root, "_modpacks_pending", False),
+                            "Finishing the modpack check or update before launching...")
+        elif getattr(root, "_modpacks_pending", False):
+            raise engine.ModpacksError("Modpacks is checking or updating files. Join again when it finishes.")
+        _before_launch(args)
+    finally:
+        if root is not None:
+            root._modpacks_launching = False
 
 
 class _Popen(subprocess.Popen):
@@ -311,13 +336,14 @@ def _add_button(anchor):
                 after = child
         for child in anchor.master.winfo_children():
             try:
-                if child.cget("text") == BUTTON_TEXT:
+                if child is getattr(root, "_modpacks_button", None) or child.cget("text") == BUTTON_TEXT:
                     return
             except Exception:
                 continue
         button = _theme._btn(anchor.master, BUTTON_TEXT, lambda: _open(root),
                              font=("Segoe UI", 9), pady=5, padx=10)
         button.pack(side="left", padx=(6, 0), after=after)
+        root._modpacks_button = button
         if not getattr(root, "_modpacks_checked", False):
             root._modpacks_checked = True
             root.after(CHECK_DELAY_MS, lambda: _startup_check(root))
@@ -331,23 +357,55 @@ def _startup_check(root):
     except Exception:
         return
     game_dir = os.path.dirname(exe)
-    if not exe or not os.path.isdir(os.path.join(game_dir, "Mods")) or not source.linked_packs(game_dir):
+    if (getattr(root, "_modpacks_pending", False) or not exe
+            or not os.path.isdir(os.path.join(game_dir, "Mods")) or not source.linked_packs(game_dir)):
         return
+    root._modpacks_pending = True
+    _status(root, "Checking...")
+    _log("Modpacks: checking linked packs for updates...", "dim")
     window.background(root, lambda: source.check_all(game_dir), lambda report, error: _checked(root, game_dir, report, error))
 
 
 def _checked(root, game_dir, report, error):
+    updating = False
+    try:
+        updating = _handle_checked(root, game_dir, report, error)
+    finally:
+        if not updating:
+            root._modpacks_pending = False
+
+
+def _handle_checked(root, game_dir, report, error):
     if error or not report:
+        _status(root, "Check failed" if error else "")
+        if error:
+            _log("Modpacks: update check failed (%s)" % error, "warn")
         return
-    waiting, blocks = [], []
+    # The user may have edited or updated a pack while the network check ran.
+    current_report = []
+    for name, manifest, found, problem in report:
+        pack = engine.find_pack(game_dir, name)
+        if pack is None or (manifest is not None and source.source_state(pack)["url"] != manifest.url):
+            continue
+        if not problem and manifest is not None:
+            try:
+                found = source.changes(pack, manifest)
+            except OSError as check_error:
+                problem = str(check_error)
+        current_report.append((name, manifest, found, problem))
+    report = current_report
+    waiting, actionable = [], []
+    deferred = False
     for name, manifest, found, problem in report:
         if problem:
             _log("Modpacks: couldn't check %s for updates (%s)" % (name, problem), "warn")
         elif source.count(found):
-            waiting.append("%s: %s" % (name, source.describe(found)))
             pack = engine.find_pack(game_dir, name)
-            lines = source.preview(pack, found) if pack is not None else [source.describe(found)]
-            blocks.append(name + "\n" + "\n".join("    " + line for line in lines))
+            if source.changes_deferred(pack, manifest, found):
+                deferred = True
+                continue
+            actionable.append((name, manifest, found, None))
+            waiting.append("%s: %s" % (name, source.describe(found)))
         else:
             pack = engine.find_pack(game_dir, name)
             if pack is not None:
@@ -357,23 +415,25 @@ def _checked(root, game_dir, report, error):
                     _log("Modpacks: couldn't save the checked file list for %s (%s)"
                          % (name, engine._why(save_error)), "warn")
     if not waiting:
-        if not any(r[3] for r in report):
+        _status(root, "Check failed" if any(r[3] for r in report) else "Updates skipped" if deferred else "")
+        if not deferred and not any(r[3] for r in report):
             _log("Modpacks: linked packs are up to date", "dim")
         return
-    valid = [(found, problem) for _, _, found, problem in report if not problem and found is not None]
-    has_unlisted = any(found.get("unlisted", found["removed"]) for found, _ in valid)
-    has_deletions = any(found["removed"] for found, _ in valid)
-    has_protected = any(found.get("protected") or found.get("managed_added") for found, _ in valid)
-    has_dropped = any(found.get("dropped") for found, _ in valid)
-    title, prompt = _update_prompt(blocks, has_unlisted, " now", has_deletions,
-                                  has_protected, has_dropped)
-    if not messagebox.askyesno(title, prompt, parent=root):
+    # Only update changes included in this prompt, including after a previous deferral.
+    report = actionable
+    if not window.ask_updates(_prompt_parent(root), game_dir, report):
+        _defer_report(game_dir, report)
+        _status(root, "Updates skipped")
         _log("Modpacks: updates skipped for now (" + "; ".join(waiting) + ")", "warn")
         return
+    _status(root, "Updating...")
     window.background(root, lambda: source.update_all(game_dir, report), lambda done, error: _updated(root, done, error))
+    return True
 
 
 def _updated(root, done, error):
+    root._modpacks_pending = False
+    _status(root, "Update failed" if error or any(r[2] for r in done or []) else "")
     if error:
         _log("Modpacks: updates failed (%s)" % error, "err")
         return

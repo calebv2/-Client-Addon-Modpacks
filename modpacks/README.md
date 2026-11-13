@@ -49,16 +49,27 @@ Some servers publish their client mods as a list, like Sheikah Sanctuary's
 that downloads those mods and keeps them up to date.
 
 - If the link's site is one of your saved or recent servers, the pack loads only on that server.
-- When the launcher opens, Modpacks checks linked packs concurrently and asks before applying changes. It also
-  checks the relevant linked pack again just before joining, so changes made while the launcher was open can be
-  installed before you connect. Manifest requests bypass HTTP and URL-keyed caches so checks see the latest list.
-  If that quick check can't reach the update site, the current pack is used.
+- When the launcher opens, Modpacks starts checking linked packs immediately and shows **Checking...** on its
+  button. Checks run concurrently and Modpacks asks before applying changes.
+- Joining reuses manifest checks from the last two minutes, including a check already in progress. Older checks
+  are refreshed before joining. Join waits for accepted updates to finish, keeping the launcher responsive.
+  Manifest requests bypass HTTP and URL-keyed caches. If a check can't reach the update site, the current pack
+  is used; failed requests are remembered for ten seconds to avoid repeated delays.
+- Skipping an update remembers those exact changes for this launcher session, so Join won't ask again.
+  New changes can still prompt, and **Check now** always requests a fresh list and lets you reconsider.
+- The update popup groups mods by pack with totals for updates, new mods, removals, and unchanged files.
+  Each mod has its own row, with its installed version when available. The list scrolls while
+  **Apply changes** and **Skip for now** stay visible. Before joining, the buttons become
+  **Apply & join** and **Join without updating**.
 - The update preview includes mods added to or removed from the link, including files managed by the launcher.
   Accepting removes unchanged linked files that are no longer listed; files you changed yourself are kept.
   `TavernEssentials.dll` in a pack or linked manifest is handled like any other pack mod and is installed,
   updated, and removed with that pack. A loose copy is also handled like any other loose mod.
 - Every file must come over https from the same site as the list and match its SHA-256, or nothing changes.
+- If saving an update fails, Modpacks restores the previous pack files. If a file can't be restored,
+  the error gives the location of the recovery copies under `Modpacks\_downloads`.
 - Mods you add to a linked pack yourself, or files you change, are never overwritten.
+- If a pack is edited while its update downloads, that update stops before replacing any files.
 - A mod you delete or move out of a linked pack isn't downloaded again. Add it back with **Add files...**.
 - Updates name every mod, like `updated DyeingAPI 1.0.0 to 1.1.0, new NightSkeletons 1.0.0`.
 - **Check now** and **Remove link** are on the pack. If you used a separate updater addon for the same mods,
@@ -101,3 +112,9 @@ A list is JSON in this shape. `name` and `servers` are optional:
 
 1. Copy the `modpacks` folder into the `addons` folder next to `TavernLauncher - Client.exe`.
 2. Open TavernLauncher, click **🧩 Addons**, tick **Modpacks**, click **Save**, then restart the launcher.
+
+## Regression checks
+
+From this folder, run `python -m unittest discover -s tests -v`. These checks use temporary folders,
+including simulated update and launch failures; they don't modify installed game files.
+Run `python tests/preview_updates.py` to preview the update popup with sample mods.

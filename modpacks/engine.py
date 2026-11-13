@@ -755,12 +755,16 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
         ledger[key] = intent
         write_json(path, ledger)
     except OSError as error:
-        problems = _rollback(staged, placed, temp)
+        problems = _rollback([], placed, temp)
+        failed_restores = set()
         for backup, live, entry in reversed(restored_shadow):
             try:
                 os.replace(live, backup)
             except OSError:
                 problems.append(entry["file"])
+                failed_restores.add(live)
+        problems.extend(_rollback([(live, entry) for live, entry in staged
+                                   if live not in failed_restores], [], None))
         for live in reversed(shadow_staged):
             try:
                 os.replace(live + OLD_SUFFIX, live)
@@ -770,7 +774,7 @@ def apply(game_dir, target, ledger_path=None, lookup=None, running=None, leave_o
             if not problems:
                 ledger[key] = before
                 write_json(path, ledger)
-            if shadow_records != original_shadowed:
+            if shadow_records != original_shadowed or restored_shadow:
                 write_shadowed(game_dir, original_shadowed)
             if not problems:
                 for backup in created_backups:

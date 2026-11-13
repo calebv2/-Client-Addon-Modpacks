@@ -2,8 +2,9 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -18,6 +19,65 @@ MAX_FILES = 300
 HEX = re.compile(r"^[0-9A-Fa-f]{64}$")
 DOWNLOADS_DIR = "_downloads"
 SEEN_LIMIT = 400
+CHECK_CACHE_SECONDS = 120
+FAILED_CHECK_CACHE_SECONDS = 10
+
+
+class ManifestChecks:
+    """Share recent manifests and in-flight requests, never cached disk changes."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.requests = {}
+
+    def get(self, url, fetcher=None, timeout=STARTUP_CHECK_TIMEOUT, force=False):
+        with self.lock:
+            previous = self.requests.get(url)
+            if previous is not None:
+                future, expires = previous
+                if not future.done() or (not force and time.monotonic() < expires):
+                    owner = False
+                else:
+                    previous = None
+            if previous is None:
+                future = Future()
+                self.requests[url] = (future, float("inf"))
+                owner = True
+        if owner:
+            try:
+                result = read_manifest(url, fetcher, timeout)
+            except Exception as error:
+                future.set_exception(error)
+                lifetime = FAILED_CHECK_CACHE_SECONDS
+            else:
+                future.set_result(result)
+                lifetime = CHECK_CACHE_SECONDS
+            with self.lock:
+                self.requests[url] = (future, time.monotonic() + lifetime)
+        return future.result()
+
+
+manifest_checks = ManifestChecks()
+_deferred = {}
+
+
+def _review_key(pack, manifest, found):
+    key = (engine.ledger_key(pack.path), manifest.url)
+    changes = {key: found.get(key, []) for key in
+               ("new", "updated", "removed", "unlisted", "dropped", "managed_added")}
+    fingerprint = json.dumps({"files": manifest.files, "listed": manifest.listed,
+                              "changes": changes}, sort_keys=True)
+    return key, fingerprint
+
+
+def defer_changes(pack, manifest, found):
+    key, fingerprint = _review_key(pack, manifest, found)
+    _deferred[key] = fingerprint
+
+
+def changes_deferred(pack, manifest, found):
+    key, fingerprint = _review_key(pack, manifest, found)
+    return _deferred.get(key) == fingerprint
 
 
 class SourceError(engine.ModpacksError):
@@ -83,7 +143,8 @@ def read_manifest(url, fetcher=None, timeout=TIMEOUT):
     try:
         manifest = json.loads(data.decode("utf-8-sig"))
     except (ValueError, UnicodeDecodeError):
-        raise SourceError("The update link didn't return a mod list.")
+        raise SourceError("The update link didn't return a JSON mod list. Use the manifest link "
+                          "(usually ending in /manifest.json), not the website's homepage.")
     entries = manifest.get("files") if isinstance(manifest, dict) else None
     if not isinstance(entries, list):
         raise SourceError("The update link didn't return a mod list.")
@@ -152,7 +213,10 @@ def changes(pack, manifest):
         low = item["filename"].lower()
         listed.add(low)
         if low not in present:
-            (dropped if low in pack.dropped else new).append(item)
+            if low not in pack.dropped:
+                new.append(item)
+            elif low not in state["listed"]:
+                dropped.append(item)
             continue
         current = engine.sha256(os.path.join(pack.path, present[low]))
         if current == item["sha256"]:
@@ -200,10 +264,12 @@ def record_manifest(pack, manifest):
         listed = {item["filename"].lower(): item["filename"] for item in manifest.files}
     listed = dict(listed)
     state = source_state(pack)
-    if state["listed"] == listed:
+    checked = time.strftime("%Y-%m-%d %H:%M")
+    if state["listed"] == listed and state["checked"] == checked:
         return False
     pack.source = dict(pack.source) if isinstance(pack.source, dict) else {}
     pack.source["listed"] = listed
+    pack.source["checked"] = checked
     pack.save()
     return True
 
@@ -328,11 +394,21 @@ def _download(item, target, game_dir, fetcher):
 
 def sync(game_dir, pack, manifest, fetcher=None):
     found = changes(pack, manifest)
+    original_metadata = engine.Pack(pack.path).state()
+    original_files = {name: engine.sha256(os.path.join(pack.path, name)) for name in pack.files()}
     work = engine.unique_path(os.path.join(engine.packs_dir(game_dir), DOWNLOADS_DIR), pack.name)
     os.makedirs(work)
+    backups, placed = [], []
+    original_source, original_on = pack.source, set(pack.on)
+    keep_work = False
     try:
         for item in found["new"] + found["updated"]:
             _download(item, os.path.join(work, item["filename"]), game_dir, fetcher)
+        # Downloads can take a while; never replace edits made during that wait.
+        current = engine.Pack(pack.path)
+        current_files = {name: engine.sha256(os.path.join(pack.path, name)) for name in current.files()}
+        if current.state() != original_metadata or current_files != original_files:
+            raise SourceError("The pack changed while its update was downloading. Nothing was installed; check again.")
         state = source_state(pack)
         present = {n.lower(): n for n in pack.files()}
         info = {}
@@ -349,14 +425,22 @@ def sync(game_dir, pack, manifest, fetcher=None):
             seen.append(engine.sha256(old))
         for name in found["removed"]:
             seen.append(engine.sha256(os.path.join(pack.path, name)))
+        backup_dir = os.path.join(work, "_previous")
+        os.makedirs(backup_dir)
+        for name in list(dict.fromkeys(
+                [present[item["filename"].lower()] for item in found["new"] + found["updated"]
+                 if item["filename"].lower() in present] + found["removed"])):
+            live = os.path.join(pack.path, name)
+            backup = os.path.join(backup_dir, name)
+            os.replace(live, backup)
+            backups.append((live, backup))
         for item in found["new"] + found["updated"]:
             low = item["filename"].lower()
             target = os.path.join(pack.path, present.get(low, item["filename"]))
             os.replace(os.path.join(work, item["filename"]), target)
+            placed.append(target)
             if engine.looks_server_only(item["filename"]) and low not in present:
                 pack.on.discard(low)
-        for name in found["removed"]:
-            os.remove(os.path.join(pack.path, name))
         files = {}
         for item in manifest.files:
             path = os.path.join(pack.path, item["filename"])
@@ -375,10 +459,30 @@ def sync(game_dir, pack, manifest, fetcher=None):
                        "seen": _trim(seen),
                        "checked": time.strftime("%Y-%m-%d %H:%M")}
         pack.save()
-    except OSError as error:
-        raise SourceError("The update couldn't be saved (%s)." % engine._why(error))
+    except Exception as error:
+        problems = []
+        for target in reversed(placed):
+            try:
+                os.remove(target)
+            except OSError:
+                problems.append(os.path.basename(target))
+        for live, backup in reversed(backups):
+            try:
+                os.replace(backup, live)
+            except OSError:
+                problems.append(os.path.basename(live))
+        pack.source, pack.on = original_source, original_on
+        if problems:
+            keep_work = True
+            raise SourceError("The update failed (%s). Some files couldn't be restored: %s. "
+                              "Recovery files were kept in %s." % (error, ", ".join(problems), work)) from error
+        if isinstance(error, OSError):
+            raise SourceError("The update couldn't be saved (%s). Previous files were restored."
+                              % engine._why(error)) from error
+        raise
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
         try:
             os.rmdir(os.path.dirname(work))
         except OSError:
@@ -440,7 +544,7 @@ def check_all(game_dir, fetcher=None):
 
 def _check_pack(pack, fetcher=None, timeout=STARTUP_CHECK_TIMEOUT):
     try:
-        manifest = read_manifest(source_state(pack)["url"], fetcher, timeout)
+        manifest = manifest_checks.get(source_state(pack)["url"], fetcher, timeout)
         return pack.name, manifest, changes(pack, manifest), None
     except Exception as error:
         return pack.name, None, None, str(error)
@@ -462,7 +566,7 @@ def update_all(game_dir, report, fetcher=None):
         if error or manifest is None or not count(found):
             continue
         pack = engine.find_pack(game_dir, name)
-        if pack is None:
+        if pack is None or source_state(pack)["url"] != manifest.url:
             continue
         try:
             done.append((name, sync(game_dir, pack, manifest, fetcher), None))

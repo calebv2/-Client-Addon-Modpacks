@@ -55,6 +55,81 @@ def background(widget, work, done):
     widget.after(150, poll)
 
 
+def wait_for(root, ready, text):
+    """Keep Tk responsive while a launch waits for an update operation."""
+    if ready():
+        return
+    finished = tk.BooleanVar(master=root, value=False)
+    dialog = tk.Toplevel(root)
+    dialog.withdraw()
+    dialog.title("Modpacks")
+    dialog.transient(root)
+    dialog.configure(bg=_theme.BG)
+    tk.Label(dialog, text=text, padx=24, pady=20, wraplength=400,
+             bg=_theme.BG, fg=_theme.PARCH, font=("Segoe UI", 10)).pack()
+    dialog.update_idletasks()
+    x = root.winfo_rootx() + max(0, (root.winfo_width() - dialog.winfo_reqwidth()) // 2)
+    dialog.geometry("+%d+%d" % (x, root.winfo_rooty() + 60))
+    cancelled = []
+    root._modpacks_wait_dialog = dialog
+
+    def cancel():
+        cancelled.append(True)
+        finished.set(True)
+
+    def destroyed(event):
+        if event.widget is dialog and not finished.get():
+            cancel()
+
+    def show():
+        if dialog.state() != "withdrawn":
+            return
+        dialog.deiconify()
+        dialog.grab_set()
+
+    def poll():
+        nonlocal poll_id
+        if ready():
+            finished.set(True)
+        else:
+            poll_id = dialog.after(50, poll)
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Destroy>", destroyed)
+    show_id = dialog.after(250, show)
+    poll_id = dialog.after(50, poll)
+    try:
+        root.wait_variable(finished)
+    finally:
+        root._modpacks_wait_dialog = None
+        try:
+            dialog.after_cancel(show_id)
+            dialog.after_cancel(poll_id)
+            dialog.destroy()
+        except tk.TclError:
+            pass
+    if cancelled:
+        raise engine.ModpacksError("Launch cancelled. The modpack check or update will finish in the background.")
+
+
+def run_waiting(root, work, text):
+    if root is None:
+        return work()
+    result = []
+    root._modpacks_pending = True
+
+    def done(value, error):
+        root._modpacks_pending = False
+        result.append((value, error))
+
+    background(root, work, done)
+    wait_for(root, lambda: bool(result), text)
+    value, error = result[0]
+    if error:
+        raise error
+    return value
+
+
 def suggested_link():
     for name, module in list(sys.modules.items()):
         url = getattr(module, "MANIFEST_URL", None) if name.startswith("addons.") else None
@@ -117,6 +192,204 @@ class ScrollList(tk.Frame):
                 return True
             widget = getattr(widget, "master", None)
         return False
+
+
+def update_sections(pack, found):
+    """Describe update actions without confusing link removals with file deletions."""
+    present = {name.lower(): name for name in pack.files()}
+
+    def row(name, note=""):
+        filename = present.get(name.lower(), name)
+        info = engine.mod_info(os.path.join(pack.path, filename)) or {}
+        detail = filename
+        if info.get("version"):
+            detail += "  ·  Installed " + info["version"]
+        if note:
+            detail += "\n" + note
+        return {"name": info.get("name") or filename[:-4], "detail": detail}
+
+    removed = {name.lower() for name in found["removed"]}
+    protected = {name.lower() for name in found.get("protected", [])}
+    unlisted = found.get("unlisted", found["removed"])
+    kept, covered = [], set()
+    for name in unlisted:
+        if name.lower() in removed:
+            continue
+        note = next((note for note in found.get("kept", []) if note.startswith(name)), None)
+        if note:
+            covered.add(note)
+        if name.lower() in protected:
+            explanation = "No longer on the link. Managed by the launcher; left unchanged."
+        elif name.lower() not in present:
+            explanation = "No longer on the link. No installed file will be deleted."
+        else:
+            explanation = note or "No longer on the link. Your local copy will be kept."
+        kept.append(row(name, explanation))
+    for note in found.get("kept", []):
+        if note in covered:
+            continue
+        name = next((name for name in sorted(present.values(), key=len, reverse=True)
+                     if note.startswith(name)), None)
+        kept.append(row(name, note) if name else {"name": "Local mod", "detail": note})
+    kept.extend(row(name, "You removed this mod. It stays excluded and will not be downloaded.")
+                for name in found.get("dropped", []))
+    kept.extend(row(name, "Listed by the link, but managed by the launcher. Left unchanged.")
+                for name in found.get("managed_added", []))
+    sections = [
+        ("updated", "To update", "AMBER", "UPDATE", [row(item["filename"]) for item in found["updated"]]),
+        ("new", "New mods", "GREEN", "NEW", [row(item["filename"]) for item in found["new"]]),
+        ("removed", "To remove", "RED", "REMOVE",
+         [row(name, "The unchanged linked copy will be removed from this pack.") for name in found["removed"]]),
+        ("kept", "Staying as they are", "MUTED", "KEEP", kept),
+    ]
+    return [{"key": key, "title": title, "color": color, "badge": badge,
+             "rows": sorted(rows, key=lambda item: item["name"].casefold())}
+            for key, title, color, badge, rows in sections if rows]
+
+
+class UpdateDialog(tk.Toplevel):
+    def __init__(self, parent, packs, server=None):
+        super().__init__(parent)
+        _chrome._start_hidden(self)
+        self.choice = False
+        self.title("Modpack updates")
+        t = _theme
+        self.configure(bg=t.BG)
+        if parent is not None and parent.winfo_viewable():
+            self.transient(parent)
+        width = min(760, self.winfo_screenwidth() - 60)
+        height = min(740, self.winfo_screenheight() - 100)
+        self._wrapping = []
+        self.counts = {key: sum(len(section["rows"]) for pack in packs for section in pack["sections"]
+                                if section["key"] == key)
+                       for key in ("updated", "new", "removed", "kept")}
+
+        header = tk.Frame(self, bg=t.BG)
+        header.pack(fill="x", padx=24, pady=(20, 16))
+        tk.Label(header, text="MODPACKS  /  REVIEW CHANGES", bg=t.BG, fg=t.AMBER,
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
+        title = "Mod updates are ready" if self.counts["updated"] or self.counts["new"] else "Review modpack changes"
+        tk.Label(header, text=title, bg=t.BG, fg=t.PARCH,
+                 font=("Georgia", 20, "bold"), anchor="w").pack(fill="x", pady=(8, 6))
+        subtitle = ("Review changes before joining %s." % server if server else
+                    "Review the changes available for your next launch.")
+        self._text(header, subtitle, t.MUTED, bg=t.BG).pack(fill="x")
+
+        summary = tk.Frame(self, bg=t.BG)
+        summary.pack(fill="x", padx=24, pady=(0, 18))
+        for column, (key, label, color) in enumerate((
+                ("updated", "Updates", t.AMBER), ("new", "New mods", t.GREEN),
+                ("removed", "Removals", t.RED), ("kept", "Unchanged", t.MUTED))):
+            summary.columnconfigure(column, weight=1, uniform="summary")
+            tile = tk.Frame(summary, bg=t.SURF, highlightbackground=t.BORDER, highlightthickness=1)
+            tile.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+            tk.Label(tile, text=str(self.counts[key]), bg=t.SURF,
+                     fg=color if self.counts[key] else t.MUTED,
+                     font=("Segoe UI", 21, "bold"), anchor="w").pack(fill="x", padx=14, pady=(8, 0))
+            tk.Label(tile, text=label, bg=t.SURF, fg=t.MUTED,
+                     font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=14, pady=(0, 10))
+
+        # Pack cards scroll; the decision buttons always stay visible.
+        footer = tk.Frame(self, bg=t.BG)
+        footer.pack(side="bottom", fill="x")
+        tk.Frame(footer, bg=t.BORDER, height=1).pack(fill="x")
+        self._text(footer, "Skipping keeps your installed mods. These same changes won't prompt again this session.",
+                   t.MUTED, bg=t.BG).pack(fill="x", padx=24, pady=(12, 10))
+        actions = tk.Frame(footer, bg=t.BG)
+        actions.pack(fill="x", padx=24, pady=(0, 18))
+        self._text(actions, "Changes apply to the next launch.", t.MUTED, bg=t.BG).pack(side="left")
+        self.apply_button = t._btn(actions, "Apply & join" if server else "Apply changes",
+                                   lambda: self.choose(True), "primary", font=("Segoe UI", 10, "bold"), pady=8, padx=16)
+        self.apply_button.pack(side="right")
+        self.skip_button = t._btn(actions, "Join without updating" if server else "Skip for now",
+                                  lambda: self.choose(False), font=("Segoe UI", 9), pady=8, padx=12)
+        self.skip_button.pack(side="right", padx=(8, 8))
+
+        heading = tk.Frame(self, bg=t.BG)
+        heading.pack(fill="x", padx=24, pady=(0, 8))
+        tk.Label(heading, text="CHANGES BY PACK", bg=t.BG, fg=t.MUTED,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(heading, text="%d pack%s" % (len(packs), "" if len(packs) == 1 else "s"),
+                 bg=t.BG, fg=t.MUTED, font=("Segoe UI", 9)).pack(side="right")
+        self.list = ScrollList(self, 300)
+        self.list.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        for pack in packs:
+            self._pack_card(pack)
+        self.bind("<MouseWheel>", self.list.wheel)
+        self.bind("<Escape>", lambda event: self.choose(False))
+        self.protocol("WM_DELETE_WINDOW", lambda: self.choose(False))
+        self.bind("<Configure>", self._resize)
+        self.update_idletasks()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2)
+        if parent is not None and parent.winfo_viewable():
+            x = max(0, min(self.winfo_screenwidth() - width, parent.winfo_rootx() + (parent.winfo_width() - width) // 2))
+            y = max(0, min(self.winfo_screenheight() - height, parent.winfo_rooty() + 30))
+        self.geometry("%dx%d+%d+%d" % (width, height, x, y))
+        self.minsize(min(640, width), min(500, height))
+        _chrome._finish_dark_window(self)
+        self.lift()
+        self.skip_button.focus_set()
+        self.grab_set()
+
+    def _text(self, parent, text, color, bg=None, bold=False, inset=100):
+        label = tk.Label(parent, text=text, bg=bg or _theme.SURF, fg=color, anchor="w", justify="left",
+                         wraplength=560, font=("Segoe UI", 9, "bold" if bold else "normal"))
+        self._wrapping.append((label, inset))
+        return label
+
+    def _resize(self, event):
+        if event.widget is self:
+            for label, inset in self._wrapping:
+                label.configure(wraplength=max(160, event.width - inset))
+
+    def _pack_card(self, pack):
+        t = _theme
+        card = tk.Frame(self.list.inner, bg=t.SURF)
+        card.pack(fill="x", padx=16, pady=(14, 4))
+        self._text(card, pack["name"], t.PARCH, bold=True).pack(fill="x")
+        if pack["host"]:
+            self._text(card, pack["host"], t.MUTED).pack(fill="x", pady=(2, 8))
+        for section in pack["sections"]:
+            color = getattr(t, section["color"])
+            tk.Label(card, text="%s  ·  %d" % (section["title"].upper(), len(section["rows"])),
+                     bg=t.SURF, fg=color, anchor="w", font=("Segoe UI", 8, "bold")).pack(fill="x", pady=(10, 6))
+            for entry in section["rows"]:
+                row = tk.Frame(card, bg=t.SURF)
+                row.pack(fill="x", pady=(0, 10))
+                tk.Label(row, text=section["badge"], fg=color, bg=t.BG,
+                         font=("Segoe UI", 8, "bold"), padx=8, pady=3, width=7).pack(side="right", anchor="n", padx=(12, 0))
+                content = tk.Frame(row, bg=t.SURF)
+                content.pack(side="left", fill="x", expand=True)
+                self._text(content, entry["name"], t.PARCH, bold=True, inset=210).pack(fill="x")
+                self._text(content, entry["detail"], t.MUTED, inset=210).pack(fill="x", pady=(2, 0))
+        tk.Frame(card, bg=t.BORDER, height=1).pack(fill="x", pady=(2, 4))
+
+    def choose(self, apply):
+        self.choice = apply
+        self.destroy()
+
+
+def ask_updates(parent, game_dir, report, server=None):
+    packs = []
+    for name, manifest, found, problem in report:
+        pack = engine.find_pack(game_dir, name)
+        if pack is not None and not problem and found is not None:
+            packs.append({"name": name, "host": pack.link_host(), "sections": update_sections(pack, found)})
+    if not packs:
+        return False
+    previous_grab = parent.grab_current() if parent is not None else None
+    dialog = UpdateDialog(parent, sorted(packs, key=lambda pack: pack["name"].casefold()), server)
+    try:
+        dialog.wait_window()
+        return dialog.choice
+    finally:
+        if previous_grab is not None:
+            try:
+                if previous_grab.winfo_viewable():
+                    previous_grab.grab_set()
+            except tk.TclError:
+                pass
 
 
 class ModpacksWindow(tk.Toplevel):
@@ -652,8 +925,8 @@ class ModpacksWindow(tk.Toplevel):
         self.say(text, bool(refused) and not moved)
 
     def from_link(self):
-        url = simpledialog.askstring("Pack from a link", "Paste the pack's update link. It lists the mods "
-                                     "and where to download them.", initialvalue=suggested_link(), parent=self)
+        url = simpledialog.askstring("Pack from a link", "Paste the pack's JSON mod-list link "
+                                     "(usually ending in /manifest.json).", initialvalue=suggested_link(), parent=self)
         if not url or url.strip() == "https://":
             return
         url = url.strip()
@@ -691,24 +964,37 @@ class ModpacksWindow(tk.Toplevel):
         self.say(text)
 
     def check_link(self):
+        if (getattr(self.root, "_modpacks_pending", False)
+                or getattr(self.root, "_modpacks_launching", False)):
+            self.say("A modpack check, update, or launch is already in progress. Please wait.")
+            return
         pack = self.current()
         if pack is None:
             return
         url = source.source_state(pack)["url"]
+        self.root._modpacks_pending = True
         self.say("Checking %s for updates..." % pack.link_host())
-        background(self, lambda: source.read_manifest(url),
+        background(self.root, lambda: source.manifest_checks.get(url, force=True),
                    lambda manifest, error: self._checked(pack.name, manifest, error))
 
     def _checked(self, name, manifest, error):
+        updating = False
+        try:
+            if self.winfo_exists():
+                updating = self._handle_link_checked(name, manifest, error)
+        finally:
+            if not updating:
+                self.root._modpacks_pending = False
+
+    def _handle_link_checked(self, name, manifest, error):
         if error:
             self.say(str(error), True)
             return
         pack = engine.find_pack(self.game_dir, name)
-        if pack is None:
+        if pack is None or source.source_state(pack)["url"] != manifest.url:
             return
         found = source.changes(pack, manifest)
         notes = (" Not changed: " + ", ".join(found["kept"]) + ".") if found["kept"] else ""
-        unlisted = found.get("unlisted", found["removed"])
         if not source.count(found):
             try:
                 source.record_manifest(pack, manifest)
@@ -717,26 +1003,20 @@ class ModpacksWindow(tk.Toplevel):
                 return
             self.say("%s is up to date.%s" % (name, notes))
             return
-        prompt = "%s has changes:\n\n%s" % (name, "\n".join(source.preview(pack, found)))
-        if unlisted:
-            prompt += "\n\nThe link no longer lists the mods under \"Removed from link\"."
-            if found["removed"]:
-                prompt += " Accepting removes unchanged copies from the pack."
-        if found.get("protected") or found.get("managed_added"):
-            prompt += " Launcher-managed files are reported but never installed or removed by Modpacks."
-        if found.get("dropped"):
-            prompt += ("\n\nThe mods marked \"Back on link, still skipped because you removed it\" "
-                       "will remain excluded. Add them back to the pack if you want them.")
-        prompt += "\n\nApply these changes now?"
-        title = "Update %s" % name if not unlisted else "Update %s from link" % name
-        if not messagebox.askyesno(title, prompt, parent=self):
+        report = [(name, manifest, found, None)]
+        if not ask_updates(self, self.game_dir, report):
+            source.defer_changes(pack, manifest, found)
             self.say("")
             return
         self.say("Updating %s..." % name)
-        background(self, lambda: source.sync(self.game_dir, pack, manifest),
+        background(self.root, lambda: source.sync(self.game_dir, pack, manifest),
                    lambda done, error: self._synced(name, done, error))
+        return True
 
     def _synced(self, name, found, error):
+        self.root._modpacks_pending = False
+        if not self.winfo_exists():
+            return
         if error:
             self.say(str(error), True)
             return
